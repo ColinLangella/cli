@@ -739,7 +739,6 @@ def compare_checksums(shared_objects, worker_state, batches):
     mode = shared_objects["mode"]
 
     for batch in batches:
-        print("START")
         where_clause = str()
         tmp_where_clause = list()
         
@@ -918,7 +917,6 @@ def compare_checksums(shared_objects, worker_state, batches):
                     result_queue.append(BLOCK_MISMATCH)
             else:
                 result_queue.append(BLOCK_OK)
-        print("END")
 
 
 def check_and_process_inputs(td_task: TableDiffTask) -> TableDiffTask:
@@ -1518,25 +1516,17 @@ def table_rerun_core_temptable(td_task: TableDiffTask) -> None:
         con.commit()
 
 def table_rerun_core_async(td_task: TableDiffTask) -> None:
-    row_count = 0
-    total_rows = 0
-    conn_with_max_rows = None
     table_types = None
 
     for params in td_task.conn_params:
         conn = psycopg.connect(**params)
         if not table_types:
             table_types = grab_row_types(conn, td_task.l_table)
-
-        rows = get_row_count(conn, td_task.l_schema, td_task.l_table)
-        total_rows += rows
-        if rows > row_count:
-            row_count = rows
-            conn_with_max_rows = conn
     
     # load diff data and validate
     diff_data = json.load(open(td_task.diff_file_path, "r"))
-    diff_keys = set()
+    diff_kset = set()
+    diff_keys = list()
     key = td_task.key.split(',')
     simple_primary_key = len(key) == 1
 
@@ -1546,7 +1536,9 @@ def table_rerun_core_async(td_task: TableDiffTask) -> None:
             nd1, nd2 = node_pair.split('/')
 
             for row in diff_data[node_pair][nd1] + diff_data[node_pair][nd2]:
-                diff_keys.add(row[key[0]])
+                if row[key[0]] not in diff_kset:
+                    diff_kset.add(row[key[0]])
+                    diff_keys.append(row[key[0]])
             
     # Comp pkey
     else:
@@ -1554,12 +1546,13 @@ def table_rerun_core_async(td_task: TableDiffTask) -> None:
             nd1, nd2 = node_pair.split('/')
 
             for row in diff_data[node_pair][nd1] + diff_data[node_pair][nd2]:
-                diff_keys.add(
-                    tuple(row[key_component] for key_component in key)
-                )
+                element = tuple(row[key_component] for key_component in key)
+                if element not in diff_kset:
+                    diff_kset.add(element)
+                    diff_keys.append(element)
 
     # create blocks
-    diff_keys  = list(diff_keys)
+    total_rows = len(diff_kset) * len(td_task.node_list)
     total_diff = len(diff_keys)
 
     if total_diff > 100:
@@ -1567,14 +1560,13 @@ def table_rerun_core_async(td_task: TableDiffTask) -> None:
         block_nums = ceil(total_diff/block_size)
         
         blocks = [
-            diff_keys[i*block_size : i*block_size + block_size]
+            [diff_keys[i*block_size : i*block_size + block_size]]
             for i in range(block_nums)
         ]
     else:
-        blocks = [list(diff_keys)]
+        blocks = [[diff_keys]]
 
     total_blocks = len(blocks)
-    blocks = [blocks]
 
     # If we don't have enough blocks to keep all CPUs busy, use fewer processes
     cpus = cpu_count()
