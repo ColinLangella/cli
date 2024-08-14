@@ -10,17 +10,11 @@ import re
 import subprocess
 from math import ceil
 from datetime import datetime
-from itertools import combinations
-from multiprocessing import Manager, Value, Lock, cpu_count
 import logging
 
+import ace_core
 import fire
 import psycopg
-from mpire import WorkerPool
-from mpire.utils import make_single_arguments
-from ordered_set import OrderedSet
-from psycopg import sql
-from psycopg.rows import dict_row
 from flask import Flask, request, jsonify
 from apscheduler import Event, JobAdded, Scheduler
 from apscheduler.datastores.memory import MemoryDataStore
@@ -29,8 +23,8 @@ from apscheduler.eventbrokers.local import LocalEventBroker
 import cluster
 import util
 import ace_db
+import ace_config as config
 from ace_db import TableDiffTask
-from concurrent.futures import ThreadPoolExecutor
 
 
 app = Flask(__name__)
@@ -38,32 +32,11 @@ app = Flask(__name__)
 logging.basicConfig()
 logging.getLogger("apscheduler").setLevel(logging.DEBUG)
 
-# Shared variables needed by multiprocessing
-queue = Manager().list()
-result_queue = Manager().list()
-diff_dict = Manager().dict()
-row_diff_count = Value("I", 0)
-lock = Lock()
 
 # apscheduler setup
 data_store = MemoryDataStore()
 event_broker = LocalEventBroker()
 scheduler = Scheduler(data_store, event_broker)
-
-# Set max number of rows up to which
-# diff-tables will work
-MAX_DIFF_ROWS = 10000
-MIN_ALLOWED_BLOCK_SIZE = 1000
-MAX_ALLOWED_BLOCK_SIZE = 100000
-BLOCK_ROWS_DEFAULT = os.environ.get("ACE_BLOCK_ROWS", 10000)
-MAX_CPU_RATIO_DEFAULT = os.environ.get("ACE_MAX_CPU_RATIO", 0.6)
-BATCH_SIZE_DEFAULT = os.environ.get("ACE_BATCH_SIZE", 10)
-
-# Return codes for compare_checksums
-BLOCK_OK = 0
-MAX_DIFFS_EXCEEDED = 1
-BLOCK_MISMATCH = 2
-BLOCK_ERROR = 3
 
 
 """
@@ -81,10 +54,6 @@ def prCyan(skk):
 
 def prRed(skk):
     print("\033[91m {}\033[00m".format(skk))
-
-
-def get_csv_file_name(p_prfx, p_schm, p_tbl, p_base_dir="/tmp"):
-    return p_base_dir + os.sep + p_prfx + "-" + p_schm + "-" + p_tbl + ".csv"
 
 
 def get_dump_file_name(p_prfx, p_schm, p_base_dir="/tmp"):
@@ -264,7 +233,7 @@ def parse_nodes(nodes, quiet_mode=False) -> list:
     return node_list
 
 
-def grab_row_types(conn, table_name):
+def get_row_types(conn, table_name):
     """
     Here we are grabbing the name and data type of each row from table from the
     given conn. Using this complex query instead of a simpler one since this
@@ -378,7 +347,7 @@ def write_diffs_json(diff_dict, row_types, quiet_mode=False):
 
 
 # TODO: Come up with better naming convention for diff files
-def write_diffs_csv():
+def write_diffs_csv(diff_dict):
     import pandas as pd
 
     """
@@ -933,10 +902,14 @@ def check_and_process_inputs(td_task: TableDiffTask) -> TableDiffTask:
         raise AceException("Invalid value type for ACE_BLOCK_ROWS")
 
     # Capping max block size here to prevent the hash function from taking forever
-    if td_task.block_rows > MAX_ALLOWED_BLOCK_SIZE:
-        raise AceException(f"Block row size should be <= {MAX_ALLOWED_BLOCK_SIZE}")
-    if td_task.block_rows < MIN_ALLOWED_BLOCK_SIZE:
-        raise AceException(f"Block row size should be >= {MIN_ALLOWED_BLOCK_SIZE}")
+    if td_task.block_rows > config.MAX_ALLOWED_BLOCK_SIZE:
+        raise AceException(
+            f"Block row size should be <= {config.MAX_ALLOWED_BLOCK_SIZE}"
+        )
+    if td_task.block_rows < config.MIN_ALLOWED_BLOCK_SIZE:
+        raise AceException(
+            f"Block row size should be >= {config.MIN_ALLOWED_BLOCK_SIZE}"
+        )
 
     if type(td_task.max_cpu_ratio) is int:
         td_task.max_cpu_ratio = float(td_task.max_cpu_ratio)
@@ -1367,11 +1340,11 @@ def table_diff_api():
     cluster_name = request.args.get("cluster_name")
     table_name = request.args.get("table_name")
     dbname = request.args.get("dbname")
-    block_rows = request.args.get("block_rows", BLOCK_ROWS_DEFAULT)
-    max_cpu_ratio = request.args.get("max_cpu_ratio", MAX_CPU_RATIO_DEFAULT)
+    block_rows = request.args.get("block_rows", config.BLOCK_ROWS_DEFAULT)
+    max_cpu_ratio = request.args.get("max_cpu_ratio", config.MAX_CPU_RATIO_DEFAULT)
     output = request.args.get("output", "json")
     nodes = request.args.get("nodes", "all")
-    batch_size = request.args.get("batch_size", BATCH_SIZE_DEFAULT)
+    batch_size = request.args.get("batch_size", config.BATCH_SIZE_DEFAULT)
     quiet = request.args.get("quiet", False)
 
     task_id = ace_db.generate_task_id()
@@ -1393,22 +1366,40 @@ def table_diff_api():
 
         td_task = check_and_process_inputs(raw_args)
         ace_db.create_ace_task(td_task=td_task)
-        scheduler.add_job(table_diff_core, args=(td_task,))
+        scheduler.add_job(ace_core.table_diff_core, args=(td_task,))
 
-        return jsonify({"task_id": task_id})
+        return jsonify({"task_id": task_id, "submitted_at": datetime.now().isoformat()})
     except AceException as e:
         return jsonify({"error": str(e)})
+
+
+@app.route("/ace/task-status", methods=["GET"])
+def task_status_api():
+    task_id = request.args.get("task_id")
+
+    if not task_id:
+        return jsonify({"error": "task_id is a required parameter"})
+
+    try:
+        task_details = ace_db.get_ace_task(task_id)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+    if not task_details:
+        return jsonify({"error": f"Task {task_id} not found"})
+
+    return jsonify(task_details)
 
 
 def table_diff_cli(
     cluster_name,
     table_name,
     dbname=None,
-    block_rows=BLOCK_ROWS_DEFAULT,
-    max_cpu_ratio=MAX_CPU_RATIO_DEFAULT,
+    block_rows=config.BLOCK_ROWS_DEFAULT,
+    max_cpu_ratio=config.MAX_CPU_RATIO_DEFAULT,
     output="json",
     nodes="all",
-    batch_size=BATCH_SIZE_DEFAULT,
+    batch_size=config.BATCH_SIZE_DEFAULT,
     quiet=False,
 ):
 
@@ -1430,7 +1421,7 @@ def table_diff_cli(
         )
         td_task = check_and_process_inputs(raw_args)
         ace_db.create_ace_task(td_task=td_task)
-        table_diff_core(td_task)
+        ace_core.table_diff_core(td_task)
     except AceException as e:
         util.exit_message(str(e))
 
@@ -2812,11 +2803,11 @@ if __name__ == "__main__":
     fire.Fire(
         {
             "table-diff": table_diff_cli,
-            "table-repair": table_repair,
-            "table-rerun": table_rerun,
-            "repset-diff": repset_diff,
-            "schema-diff": schema_diff,
-            "spock-diff": spock_diff,
+            "table-repair": table_repair_cli,
+            "table-rerun": table_rerun_cli,
+            "repset-diff": repset_diff_cli,
+            "schema-diff": schema_diff_cli,
+            "spock-diff": spock_diff_cli,
             "start": start_ace,
         }
     )
